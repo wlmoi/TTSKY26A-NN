@@ -69,6 +69,8 @@ async def send_feature_and_capture(dut, feature):
     if busy(dut):
         await wait_for_busy_state(dut, 0)
 
+    # Drive only on clock edges to avoid writes in ReadOnly phase.
+    await RisingEdge(dut.clk)
     dut.ui_in.value = pack_ui(feature, 1)
     await RisingEdge(dut.clk)
 
@@ -143,6 +145,7 @@ async def test_project(dut):
     )
 
     # Return to normal mode.
+    await RisingEdge(dut.clk)
     dut.uio_in.value = 0x00
     dut.ui_in.value = pack_ui(0, 0)
     await wait_cycles(dut, 2)
@@ -154,6 +157,7 @@ async def test_project(dut):
     assert int(dut.uo_out.value) == 0, "Output not cleared by local reset"
     assert int(dut.uio_out.value) == 0, "uio_out not cleared by local reset"
 
+    await RisingEdge(dut.clk)
     dut.uio_in.value = 0x00
     await wait_cycles(dut, 2)
 

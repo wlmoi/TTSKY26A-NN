@@ -32,6 +32,7 @@ module tt_um_lstm_wakeword (
   wire [6:0] audio_feature;
   wire data_valid;
   wire reset_local;
+  wire core_reset_n;
   wire debug_mode;
 
   wire [7:0] h_lstm;
@@ -46,6 +47,7 @@ module tt_um_lstm_wakeword (
   assign audio_feature = ui_in[6:0];
   assign data_valid = ui_in[7];
   assign reset_local = uio_in[0];
+  assign core_reset_n = rst_n & ~reset_local;
   assign debug_mode = uio_in[1];
 
   // ===== Debug Mode: Bypass Chain =====
@@ -58,7 +60,7 @@ module tt_um_lstm_wakeword (
   
   nn_input_sync input_sync_inst (
     .clk(clk),
-    .reset_n(~reset_local),
+    .reset_n(core_reset_n),
     .audio_feature_in(audio_feature),
     .data_valid_in(data_valid),
     .audio_sync(audio_sync),
@@ -68,7 +70,7 @@ module tt_um_lstm_wakeword (
   // ===== LSTM Layer =====
   nn_lstm_layer lstm_layer_inst (
     .clk(clk),
-    .reset_n(~reset_local),
+    .reset_n(core_reset_n),
     .x_in(debug_mode ? debug_output : audio_sync),
     .valid_in(debug_mode ? data_valid : valid_sync),
     .h_out(h_lstm),
@@ -78,7 +80,7 @@ module tt_um_lstm_wakeword (
   // ===== Dense Output Layer =====
   nn_dense_layer dense_inst (
     .clk(clk),
-    .reset_n(~reset_local),
+    .reset_n(core_reset_n),
     .h_in(h_lstm),
     .valid_in(1'b1),  // Always process LSTM output
     .prob_out(prob_out),
@@ -88,7 +90,7 @@ module tt_um_lstm_wakeword (
   // ===== Confidence Calculator & Trigger Detection =====
   nn_confidence_calc confidence_inst (
     .clk(clk),
-    .reset_n(~reset_local),
+    .reset_n(core_reset_n),
     .prob_in(prob_out),
     .valid_in(valid_lstm),
     .confidence(confidence),
@@ -99,7 +101,7 @@ module tt_um_lstm_wakeword (
   // ===== Busy Controller =====
   nn_busy_controller busy_ctrl_inst (
     .clk(clk),
-    .reset_n(~reset_local),
+    .reset_n(core_reset_n),
     .valid_in(data_valid),
     .lstm_busy(busy_lstm),
     .busy_out(busy_chip)

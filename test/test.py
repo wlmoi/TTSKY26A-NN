@@ -2,167 +2,159 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import cocotb
-from cocotb.triggers import RisingEdge
+from cocotb.triggers import ReadOnly, RisingEdge
 
 
-WINDOW = 256
+MAX_WAIT_CYCLES = 120
 
 
-def pack_ui(enable, bitstream, offset_trim):
-    return ((offset_trim & 0xF) << 4) | ((bitstream & 0x1) << 1) | (enable & 0x1)
+def encode_feature(value):
+    if value < -64 or value > 63:
+        raise ValueError(f"Audio feature out of 7-bit signed range: {value}")
+    return value & 0x7F
 
 
-def status_nibble(dut):
-    return (int(dut.uio_out.value) >> 4) & 0xF
+def pack_ui(audio_feature, data_valid):
+    return ((data_valid & 0x1) << 7) | (encode_feature(audio_feature) & 0x7F)
 
 
-def status_valid(dut):
-    return status_nibble(dut) & 0x1
+def busy(dut):
+    return (int(dut.uo_out.value) >> 7) & 0x1
 
 
-def status_busy(dut):
-    return (status_nibble(dut) >> 1) & 0x1
+def confidence(dut):
+    return (int(dut.uo_out.value) >> 1) & 0x3F
 
 
-def status_activity(dut):
-    return (status_nibble(dut) >> 2) & 0x1
+def trigger(dut):
+    return int(dut.uo_out.value) & 0x1
 
 
-def status_saturated(dut):
-    return (status_nibble(dut) >> 3) & 0x1
+def busy_echo(dut):
+    return (int(dut.uio_out.value) >> 7) & 0x1
 
 
-def offset_to_signed(offset_trim):
-    return offset_trim - 16 if (offset_trim & 0x8) else offset_trim
-
-
-def expected_code(raw_code, gain_trim, offset_trim):
-    gain_factor = 16 + (gain_trim & 0xF)
-    scaled = (raw_code * gain_factor + 8) >> 4
-    corrected = scaled + offset_to_signed(offset_trim)
-    if corrected < 0:
-        return 0
-    if corrected > 255:
-        return 255
-    return corrected
-
-
-def make_density_pattern(ones_count, length=WINDOW):
-    ones_count = max(0, min(length, int(ones_count)))
-    accumulator = 0
-    bits = []
-    for _ in range(length):
-        accumulator += ones_count
-        if accumulator >= length:
-            bits.append(1)
-            accumulator -= length
-        else:
-            bits.append(0)
-    return bits
-
-
-async def stream_windows_and_capture(dut, raw_windows, gain_trim, offset_trim):
-    captures = []
-    dut.uio_in.value = gain_trim & 0xF
-
-    # Reset the decimator phase between scenarios so one scenario does not
-    # leak window alignment into the next one.
-    dut.ui_in.value = pack_ui(0, 0, offset_trim)
-    for _ in range(4):
+async def wait_cycles(dut, count):
+    for _ in range(count):
         await RisingEdge(dut.clk)
 
-    for raw in raw_windows:
-        for bit in make_density_pattern(raw):
-            dut.ui_in.value = pack_ui(1, bit, offset_trim)
-            await RisingEdge(dut.clk)
-            if status_valid(dut):
-                captures.append(
-                    {
-                        "code": int(dut.uo_out.value),
-                        "activity": status_activity(dut),
-                        "saturated": status_saturated(dut),
-                    }
-                )
 
-    dut.ui_in.value = pack_ui(1, 0, offset_trim)
-    for _ in range(32):
+async def wait_for_busy_state(dut, expected_state, max_cycles=MAX_WAIT_CYCLES):
+    for cycle in range(max_cycles):
         await RisingEdge(dut.clk)
-        if status_valid(dut):
-            captures.append(
-                {
-                    "code": int(dut.uo_out.value),
-                    "activity": status_activity(dut),
-                    "saturated": status_saturated(dut),
-                }
-            )
-
-    return captures
+        await ReadOnly()
+        if busy(dut) == expected_state:
+            return cycle + 1
+    assert False, f"Timed out waiting for busy={expected_state} after {max_cycles} cycles"
 
 
-async def capture_steady_sample(dut, raw_code, gain_trim, offset_trim):
-    # Use multiple identical windows and take the last capture so the
-    # measurement is phase-stable across simulators.
-    captured = await stream_windows_and_capture(
-        dut,
-        raw_windows=[raw_code, raw_code, raw_code, raw_code],
-        gain_trim=gain_trim,
-        offset_trim=offset_trim,
+async def apply_resets(dut):
+    # Use both global rst_n and local uio reset to guarantee deterministic startup.
+    dut.ena.value = 0
+    dut.ui_in.value = pack_ui(0, 0)
+    dut.uio_in.value = 0x01  # local reset bit
+    dut.rst_n.value = 0
+    await wait_cycles(dut, 6)
+
+    dut.rst_n.value = 1
+    await wait_cycles(dut, 4)
+
+    dut.uio_in.value = 0x00
+    dut.ena.value = 1
+    await wait_cycles(dut, 4)
+
+
+async def send_feature_and_capture(dut, feature):
+    # Ensure the pipeline is idle before starting a new sample.
+    if busy(dut):
+        await wait_for_busy_state(dut, 0)
+
+    dut.ui_in.value = pack_ui(feature, 1)
+    await RisingEdge(dut.clk)
+
+    # Deassert data_valid after one cycle.
+    dut.ui_in.value = pack_ui(feature, 0)
+
+    # Wait for processing window using busy handshake.
+    await wait_for_busy_state(dut, 1, max_cycles=20)
+    await wait_for_busy_state(dut, 0, max_cycles=MAX_WAIT_CYCLES)
+    await ReadOnly()
+
+    return {
+        "feature": feature,
+        "confidence": confidence(dut),
+        "trigger": trigger(dut),
+        "busy": busy(dut),
+        "busy_echo": busy_echo(dut),
+    }
+
+
+async def capture_samples(dut, feature_sequence, minimum=2):
+    samples = []
+    for feature in feature_sequence:
+        samples.append(await send_feature_and_capture(dut, feature))
+        if len(samples) >= minimum:
+            break
+
+    assert len(samples) >= minimum, (
+        f"Did not capture enough NN output samples (got {len(samples)}, expected at least {minimum})"
     )
-    assert len(captured) >= 2, "Did not capture enough steady-state ADC samples"
-    return captured[-1]
+    return samples
 
 
 @cocotb.test()
 async def test_project(dut):
-    dut._log.info("Start ADC decimator behavior test")
+    dut._log.info("Start NN-LSTM wake-word behavior test")
 
-    dut.ena.value = 0
-    dut.ui_in.value = 0
-    dut.uio_in.value = 0
-    dut.rst_n.value = 0
+    await apply_resets(dut)
 
-    for _ in range(10):
+    # Idle checks: no data_valid means no busy pulse.
+    dut.ui_in.value = pack_ui(0, 0)
+    for _ in range(12):
         await RisingEdge(dut.clk)
+        await ReadOnly()
+        assert busy(dut) == 0, "Busy asserted while data_valid is low"
+        assert busy_echo(dut) == 0, "Busy echo asserted while data_valid is low"
 
-    dut.rst_n.value = 1
-    dut.ena.value = 1
+    # Capture low-amplitude sequence.
+    low_samples = await capture_samples(dut, [0, 1, -1, 2, -2], minimum=2)
+    for sample in low_samples:
+        assert 0 <= sample["confidence"] <= 63, "Confidence out of 6-bit range"
+        assert sample["busy"] == sample["busy_echo"], "Busy echo mismatch"
+        assert sample["trigger"] in (0, 1), "Trigger is not a single-bit value"
 
-    for _ in range(10):
-        await RisingEdge(dut.clk)
+    # Capture higher-amplitude sequence and expect confidence to not regress.
+    high_samples = await capture_samples(dut, [48, 56, 60, 63], minimum=2)
+    low_peak = max(s["confidence"] for s in low_samples)
+    high_peak = max(s["confidence"] for s in high_samples)
+    assert high_peak >= low_peak, (
+        f"High-amplitude confidence did not improve: low_peak={low_peak}, high_peak={high_peak}"
+    )
 
-    # Disabled behavior check: no valid pulse while ADC enable bit is low.
-    dut.ui_in.value = pack_ui(0, 1, 0)
-    for _ in range(320):
-        await RisingEdge(dut.clk)
-        assert status_valid(dut) == 0, "Valid pulse asserted while ADC disabled"
-        assert status_busy(dut) == 0, "Busy status asserted while ADC disabled"
+    # Debug mode bypass: uo_out[6:0] mirrors ui_in[6:0], uo_out[7] forced low.
+    debug_feature = 0x35
+    dut.uio_in.value = 0x02  # debug_mode=1
+    dut.ui_in.value = (1 << 7) | debug_feature
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+    debug_out = int(dut.uo_out.value)
+    assert debug_out == debug_feature, (
+        f"Debug bypass mismatch: expected 0x{debug_feature:02x}, got 0x{debug_out:02x}"
+    )
 
-    for raw in [24, 96, 180, 240]:
-        sample = await capture_steady_sample(dut, raw_code=raw, gain_trim=0, offset_trim=0)
-        expected = expected_code(raw, 0, 0)
-        assert sample["code"] == expected, (
-            f"Nominal conversion mismatch at raw={raw}. Expected {expected}, got {sample['code']}"
-        )
+    # Return to normal mode.
+    dut.uio_in.value = 0x00
+    dut.ui_in.value = pack_ui(0, 0)
+    await wait_cycles(dut, 2)
 
-    # Gain and positive offset check.
-    gain_trim = 8
-    offset_trim = 0x3
-    for raw in [40, 120, 220]:
-        sample = await capture_steady_sample(dut, raw_code=raw, gain_trim=gain_trim, offset_trim=offset_trim)
-        expected = expected_code(raw, gain_trim, offset_trim)
-        assert sample["code"] == expected, (
-            f"Calibrated conversion mismatch at raw={raw}. Expected {expected}, got {sample['code']}"
-        )
+    # Local reset should clear output state.
+    dut.uio_in.value = 0x01
+    await wait_cycles(dut, 3)
+    await ReadOnly()
+    assert int(dut.uo_out.value) == 0, "Output not cleared by local reset"
+    assert int(dut.uio_out.value) == 0, "uio_out not cleared by local reset"
 
-    # Saturation and activity checks.
-    sample = await capture_steady_sample(dut, raw_code=250, gain_trim=15, offset_trim=0x7)
-    assert sample["code"] == 255, "High-end clipping failed to saturate at 255"
-    assert sample["saturated"] == 1, "Saturation status did not assert for clipped sample"
+    dut.uio_in.value = 0x00
+    await wait_cycles(dut, 2)
 
-    sample = await capture_steady_sample(dut, raw_code=128, gain_trim=0, offset_trim=0)
-    assert sample["activity"] == 1, "Activity status did not assert on toggling bitstream"
-
-    sample = await capture_steady_sample(dut, raw_code=0, gain_trim=0, offset_trim=0)
-    assert sample["activity"] == 0, "Activity status remained asserted on static input"
-
-    dut._log.info("ADC decimator checks passed")
+    dut._log.info("NN-LSTM cocotb checks passed")

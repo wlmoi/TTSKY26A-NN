@@ -1,3 +1,5 @@
+yaml_version: 6
+
 # Tiny Tapeout project information
 project:
   title:        "TTSKY26A Neural Network - LSTM Wake Word Detector"
@@ -53,9 +55,4 @@ pinout:
   uio[4]: "Reserved"
   uio[5]: "Reserved"
   uio[6]: "Reserved"
-  uio[7]: "Reserved"
-
-  # Bidirectional (outputs)
-  # Note: Only uio[7] is an output (busy echo)
-  uio_out[7]: "Busy echo flag"
-  uio_out[6:0]: "Tied to ground"
+  uio[7]: "Busy echo flag (driven as output in RTL)"

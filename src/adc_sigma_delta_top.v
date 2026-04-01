@@ -30,6 +30,10 @@ module adc_sigma_delta_top #(
     wire activity_now;
     wire [3:0] status_bits;
     wire [3:0] raw_nibble;
+    reg [3:0] gain_trim_sync;
+    reg [3:0] offset_trim_sync;
+    reg [3:0] gain_trim_window;
+    reg [3:0] offset_trim_window;
 
     adc_input_synchronizer u_sync (
         .clk            (clk),
@@ -60,10 +64,29 @@ module adc_sigma_delta_top #(
         .raw_saturated  (raw_saturated)
     );
 
+    // Synchronize external trims and only update active trim values at
+    // window boundaries. This keeps calibration deterministic in GL timing.
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            gain_trim_sync <= 4'h0;
+            offset_trim_sync <= 4'h0;
+            gain_trim_window <= 4'h0;
+            offset_trim_window <= 4'h0;
+        end else begin
+            gain_trim_sync <= gain_trim;
+            offset_trim_sync <= offset_trim;
+
+            if (!sample_enable || raw_ready) begin
+                gain_trim_window <= gain_trim_sync;
+                offset_trim_window <= offset_trim_sync;
+            end
+        end
+    end
+
     adc_gain_offset_cal u_gain_offset (
         .raw_code        (raw_code),
-        .gain_trim       (gain_trim),
-        .offset_trim     (offset_trim),
+        .gain_trim       (gain_trim_window),
+        .offset_trim     (offset_trim_window),
         .calibrated_code (calibrated_code),
         .clip_hi         (clip_hi),
         .clip_lo         (clip_lo)

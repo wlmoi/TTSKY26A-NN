@@ -7,7 +7,7 @@ project:
   discord:      "wlmoi"
   description:  "8-bit quantized LSTM for real-time 'NYALA' (Light On) wake word detection. Privacy-first smart home voice controller."
   language:     "Verilog"
-  clock_hz:     13560000
+  clock_hz:     25000000
 
   # Tiles
   tiles: "1x1"

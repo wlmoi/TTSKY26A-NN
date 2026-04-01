@@ -27,9 +27,9 @@ module tb ();
   wire VGND = 1'b0;
 `endif
 
-  // 13.56MHz reference clock
+  // 25MHz reference clock
   initial clk = 1'b0;
-  always #36.873 clk = ~clk;
+  always #20 clk = ~clk;
 
   // Initialize driven inputs to avoid X-propagation at t=0
   initial begin
